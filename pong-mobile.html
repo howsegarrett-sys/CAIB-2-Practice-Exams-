@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0,
+                 user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#000000">
+  <title>Pong</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #000;
+      overflow: hidden;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; position: fixed; top: 0; left: 0; }
+
+    #mode-btn {
+      position: fixed;
+      bottom: max(env(safe-area-inset-bottom, 0px), 20px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255,255,255,0.10);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.30);
+      border-radius: 20px;
+      padding: 9px 24px;
+      font: 14px 'Courier New', monospace;
+      letter-spacing: 1px;
+      cursor: pointer;
+      z-index: 20;
+      -webkit-tap-highlight-color: transparent;
+      display: block;
+    }
+    #mode-btn.hidden { display: none; }
+
+    #rotate-msg {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: #000;
+      color: #fff;
+      font-family: 'Courier New', monospace;
+      font-size: 17px;
+      text-align: center;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 30;
+    }
+    #rotate-msg.show { display: flex; }
+    #rotate-icon { font-size: 48px; display: inline-block;
+                   animation: spin 2s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <canvas id="pong"></canvas>
+  <button id="mode-btn">VS CPU</button>
+  <div id="rotate-msg">
+    <span id="rotate-icon">⟳</span>
+    <span>Rotate to landscape to play</span>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ── Elements ──────────────────────────────────────────────────────────
+    const canvas    = document.getElementById('pong');
+    const ctx       = canvas.getContext('2d');
+    const modeBtn   = document.getElementById('mode-btn');
+    const rotateMsg = document.getElementById('rotate-msg');
+
+    // ── Logical dimensions (game space) ───────────────────────────────────
+    const LW = 800, LH = 500;
+    let scale = 1, offsetX = 0, offsetY = 0;
+
+    // ── Constants ─────────────────────────────────────────────────────────
+    const PADDLE_W  = 14;
+    const PADDLE_H  = 90;
+    const BALL_R    = 7;   // radius; drawn as square with side 2*BALL_R
+    const WIN_SCORE = 7;
+    const CPU_SPEED = 3.8;
+
+    // ── State ─────────────────────────────────────────────────────────────
+    let vsCP    = false;   // vs CPU toggle
+    let started = false;
+    let paused  = true;
+    let over    = false;
+
+    const scores = { left: 0, right: 0 };
+
+    const lp = { x: 22,                  y: LH / 2 - PADDLE_H / 2 };
+    const rp = { x: LW - 22 - PADDLE_W,  y: LH / 2 - PADDLE_H / 2 };
+    const ball = { x: LW / 2, y: LH / 2, vx: 0, vy: 0, speed: 6 };
+
+    // Live touch tracking: id → { side, startClientY, paddleStartY }
+    const liveTouch = {};
+
+    // ── Resize / orientation ──────────────────────────────────────────────
+    function resize() {
+      const W = window.innerWidth, H = window.innerHeight;
+      if (W <= H) {              // portrait — show rotate prompt
+        rotateMsg.classList.add('show');
+        return;
+      }
+      rotateMsg.classList.remove('show');
+      canvas.width  = W;
+      canvas.height = H;
+      scale   = Math.min(W / LW, H / LH);
+      offsetX = (W - LW * scale) / 2;
+      offsetY = (H - LH * scale) / 2;
+    }
+    window.addEventListener('resize', resize);
+    if (screen.orientation) screen.orientation.addEventListener('change', resize);
+    resize();
+
+    // ── Ball reset ────────────────────────────────────────────────────────
+    function resetBall(dir) {
+      ball.x = LW / 2;  ball.y = LH / 2;
+      ball.speed = 6;
+      const a = (Math.random() * Math.PI / 3) - Math.PI / 6;
+      ball.vx = dir * ball.speed * Math.cos(a);
+      ball.vy = ball.speed * Math.sin(a);
+    }
+
+    function clampPaddle(p) {
+      p.y = Math.max(0, Math.min(LH - PADDLE_H, p.y));
+    }
+
+    // ── Full game reset ───────────────────────────────────────────────────
+    function resetGame() {
+      scores.left = 0;  scores.right = 0;
+      lp.y = LH / 2 - PADDLE_H / 2;
+      rp.y = LH / 2 - PADDLE_H / 2;
+      started = false;  paused = true;  over = false;
+      modeBtn.classList.remove('hidden');
+    }
+
+    // ── Mode button ───────────────────────────────────────────────────────
+    modeBtn.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
+    modeBtn.addEventListener('click', () => {
+      vsCP = !vsCP;
+      modeBtn.textContent = vsCP ? '2 PLAYERS' : 'VS CPU';
+    });
+
+    // ── Touch controls ────────────────────────────────────────────────────
+    function clientToLogical(cx, cy) {
+      return { lx: (cx - offsetX) / scale, ly: (cy - offsetY) / scale };
+    }
+
+    canvas.addEventListener('touchstart', e => {
+      e.preventDefault();
+      for (const t of e.changedTouches) {
+        const { lx } = clientToLogical(t.clientX, t.clientY);
+
+        if (!started && !over) {
+          // Any tap on the canvas starts the game
+          started = true;  paused = false;
+          modeBtn.classList.add('hidden');
+          resetBall(Math.random() < 0.5 ? 1 : -1);
+          return;
+        }
+        if (over) { resetGame(); return; }
+
+        // Centre strip (80 px wide) — pause/resume
+        if (Math.abs(lx - LW / 2) < 40) {
+          paused = !paused;
+          return;
+        }
+
+        const side   = lx < LW / 2 ? 'left' : 'right';
+        const paddle = side === 'left' ? lp : rp;
+        if (vsCP && side === 'right') continue;   // CPU owns right side
+        liveTouch[t.identifier] = {
+          side,
+          startClientY:  t.clientY,
+          paddleStartY:  paddle.y,
+        };
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', e => {
+      e.preventDefault();
+      for (const t of e.changedTouches) {
+        const info = liveTouch[t.identifier];
+        if (!info) continue;
+        const paddle = info.side === 'left' ? lp : rp;
+        paddle.y = info.paddleStartY + (t.clientY - info.startClientY) / scale;
+        clampPaddle(paddle);
+      }
+    }, { passive: false });
+
+    function endTouch(e) {
+      for (const t of e.changedTouches) delete liveTouch[t.identifier];
+    }
+    canvas.addEventListener('touchend',   endTouch);
+    canvas.addEventListener('touchcancel', endTouch);
+
+    // ── Keyboard (desktop fallback) ───────────────────────────────────────
+    const keys = {};
+    window.addEventListener('keydown', e => {
+      keys[e.code] = true;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (over)        { resetGame(); return; }
+        if (!started)    { started = true; paused = false; modeBtn.classList.add('hidden'); resetBall(Math.random() < 0.5 ? 1 : -1); }
+        else             { paused = !paused; }
+      }
+    });
+    window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+    // ── CPU AI ────────────────────────────────────────────────────────────
+    function moveCPU() {
+      const target = ball.y - PADDLE_H / 2;
+      const diff   = target - rp.y;
+      rp.y += Math.sign(diff) * Math.min(Math.abs(diff), CPU_SPEED);
+      clampPaddle(rp);
+    }
+
+    // ── Update ────────────────────────────────────────────────────────────
+    function update() {
+      if (!started || paused || over) return;
+
+      // Keyboard paddle movement
+      if (keys['KeyW'])      lp.y -= 6;
+      if (keys['KeyS'])      lp.y += 6;
+      if (!vsCP) {
+        if (keys['ArrowUp'])   rp.y -= 6;
+        if (keys['ArrowDown']) rp.y += 6;
+      }
+      clampPaddle(lp);
+      clampPaddle(rp);
+
+      if (vsCP) moveCPU();
+
+      ball.x += ball.vx;
+      ball.y += ball.vy;
+
+      // Top / bottom walls
+      if (ball.y - BALL_R <= 0)  { ball.y = BALL_R;       ball.vy =  Math.abs(ball.vy); }
+      if (ball.y + BALL_R >= LH) { ball.y = LH - BALL_R;  ball.vy = -Math.abs(ball.vy); }
+
+      // Left paddle
+      if (ball.vx < 0 &&
+          ball.x - BALL_R <= lp.x + PADDLE_W &&
+          ball.x + BALL_R >= lp.x &&
+          ball.y + BALL_R >= lp.y &&
+          ball.y - BALL_R <= lp.y + PADDLE_H) {
+        ball.x = lp.x + PADDLE_W + BALL_R;
+        const a = ((ball.y - (lp.y + PADDLE_H / 2)) / (PADDLE_H / 2)) * (Math.PI / 3);
+        ball.speed = Math.min(ball.speed + 0.35, 15);
+        ball.vx =  ball.speed * Math.cos(a);
+        ball.vy =  ball.speed * Math.sin(a);
+      }
+
+      // Right paddle
+      if (ball.vx > 0 &&
+          ball.x + BALL_R >= rp.x &&
+          ball.x - BALL_R <= rp.x + PADDLE_W &&
+          ball.y + BALL_R >= rp.y &&
+          ball.y - BALL_R <= rp.y + PADDLE_H) {
+        ball.x = rp.x - BALL_R;
+        const a = ((ball.y - (rp.y + PADDLE_H / 2)) / (PADDLE_H / 2)) * (Math.PI / 3);
+        ball.speed = Math.min(ball.speed + 0.35, 15);
+        ball.vx = -ball.speed * Math.cos(a);
+        ball.vy =  ball.speed * Math.sin(a);
+      }
+
+      // Scoring
+      if (ball.x < 0) {
+        scores.right++;
+        if (scores.right >= WIN_SCORE) { over = true; return; }
+        paused = true;
+        setTimeout(() => { resetBall(1);  paused = false; }, 800);
+      }
+      if (ball.x > LW) {
+        scores.left++;
+        if (scores.left >= WIN_SCORE) { over = true; return; }
+        paused = true;
+        setTimeout(() => { resetBall(-1); paused = false; }, 800);
+      }
+    }
+
+    // ── Draw ──────────────────────────────────────────────────────────────
+    function drawPaddle(x, y) {
+      const r = PADDLE_W / 2;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      if (ctx.roundRect) {
+        ctx.roundRect(x, y, PADDLE_W, PADDLE_H, r);
+      } else {
+        ctx.rect(x, y, PADDLE_W, PADDLE_H);
+      }
+      ctx.fill();
+    }
+
+    function text(str, x, y, size, color = '#fff', align = 'center') {
+      ctx.fillStyle = color;
+      ctx.font = `bold ${size}px "Courier New", monospace`;
+      ctx.textAlign = align;
+      ctx.textBaseline = 'middle';
+      ctx.fillText(str, x, y);
+    }
+
+    function overlay(alpha) {
+      ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+      ctx.fillRect(0, 0, LW, LH);
+    }
+
+    function draw() {
+      const CW = canvas.width, CH = canvas.height;
+      ctx.clearRect(0, 0, CW, CH);
+
+      ctx.save();
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+
+      // Field
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, LW, LH);
+
+      // Centre line
+      ctx.setLineDash([12, 12]);
+      ctx.strokeStyle = '#2a2a2a';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(LW / 2, 0);
+      ctx.lineTo(LW / 2, LH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Scores
+      text(scores.left,  LW / 4,     52, 44);
+      text(scores.right, LW * 3 / 4, 52, 44);
+
+      // Paddles & ball
+      drawPaddle(lp.x, lp.y);
+      drawPaddle(rp.x, rp.y);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(ball.x - BALL_R, ball.y - BALL_R, BALL_R * 2, BALL_R * 2);
+
+      // ── Overlays ──────────────────────────────────────────────────────
+      if (!started && !over) {
+        overlay(0.55);
+        text('PONG',     LW / 2, LH / 2 - 46, 60);
+        text('Tap to start', LW / 2, LH / 2 + 12, 20, '#ddd');
+        const modeLabel = vsCP ? 'vs CPU' : '2 Players — each drag their side';
+        text(modeLabel,  LW / 2, LH / 2 + 46, 15, '#888');
+      }
+
+      if (paused && started && !over) {
+        overlay(0.48);
+        text('PAUSED',           LW / 2, LH / 2 - 22, 46);
+        text('Tap centre to resume', LW / 2, LH / 2 + 28, 17, '#ccc');
+      }
+
+      if (over) {
+        overlay(0.60);
+        const winner = scores.left >= WIN_SCORE ? 'Player 1' : (vsCP ? 'CPU' : 'Player 2');
+        text(`${winner} Wins!`, LW / 2, LH / 2 - 34, 48);
+        text('Tap to play again', LW / 2, LH / 2 + 26, 19, '#ddd');
+      }
+
+      ctx.restore();
+    }
+
+    // ── Loop ─────────────────────────────────────────────────────────────
+    function loop() {
+      update();
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    loop();
+  }());
+  </script>
+</body>
+</html>
